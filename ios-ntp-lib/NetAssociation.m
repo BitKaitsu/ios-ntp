@@ -391,27 +391,32 @@ double ntpDiffSeconds(struct ntpTimestamp * start, struct ntpTimestamp * stop) {
   └──────────────────────────────────────────────────────────────────────────────────────────────────┘*/
     double	stdDev = 0.0;
     if (good > 0 || fail > 3) {
-        _offset = _offset / good;                                   // average good times
-
+        if (good > 0) {
+            _offset = _offset / good;   // average good times
+        }
+        
         for (short i = 0; i < 8; i++) {
             if (isnan(fifoQueue[i])) continue;
-
+            
             if (isinf(fifoQueue[i]) || fabs(fifoQueue[i]) < 0.001) continue;
-
+            
             stdDev += (fifoQueue[i] - _offset) * (fifoQueue[i] - _offset);
         }
-        stdDev = sqrt(stdDev/(float)good);
-
+        
+        if (good > 0) {
+            stdDev = sqrt(stdDev/(float)good);
+        }
+        
         _trusty = (good+none > 4) &&                                // four or more 'fails'
                   (fabs(_offset) > stdDev*3.0);                     // s.d. < offset
-
+        
         NTP_Logging(@"  [%@] {%3.1f,%3.1f,%3.1f,%3.1f,%3.1f,%3.1f,%3.1f,%3.1f} ↑=%i, ↓=%i, %3.1f(%3.1f) %@", _server,
                     fifoQueue[0]*1000.0, fifoQueue[1]*1000.0, fifoQueue[2]*1000.0, fifoQueue[3]*1000.0,
                     fifoQueue[4]*1000.0, fifoQueue[5]*1000.0, fifoQueue[6]*1000.0, fifoQueue[7]*1000.0,
                     good, fail, _offset*1000.0, stdDev*1000.0, _trusty ? @"↑" : @"↓");
 
     }
-
+    
 /*┌──────────────────────────────────────────────────────────────────────────────────────────────────┐
   │   .. if the association is providing times which don't vary much, we could increase its polling  │
   │      interval.  In practice, once things settle down, the standard deviation on any time server  │
