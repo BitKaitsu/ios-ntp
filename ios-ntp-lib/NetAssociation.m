@@ -333,7 +333,7 @@ double ntpDiffSeconds(struct ntpTimestamp * start, struct ntpTimestamp * stop) {
   │ .. the server clock was set less than 1 minute ago                                               │
   └──────────────────────────────────────────────────────────────────────────────────────────────────┘*/
     _offset = INFINITY;                                                 // clock meaningless
-    if ((_dispersion < 50.0 && _dispersion > 0.00001) &&
+    if ((_dispersion < 50.0 && _dispersion >= 0.0/*> 0.00001*/) &&
         (stratum > 0) && (mode == 4) &&
         (ntpDiffSeconds(&ntpServerBaseTime, &ntpServerSendTime) < 60.0)) {
 
