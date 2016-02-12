@@ -5,33 +5,14 @@
   ╚══════════════════════════════════════════════════════════════════════════════════════════════════╝*/
 
 #import "NetAssociation.h"
-#import <sys/time.h>
 #import "ntp-log.h"
-#import "GCDAsyncUdpSocket.h"
 
-/*┌──────────────────────────────────────────────────────────────────────────────────────────────────┐
-  │  NTP Timestamp Structure                                                                         │
-  │                                                                                                  │
-  │   0                   1                   2                   3                                  │
-  │   0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1                                │
-  │  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+                               │
-  │  |                           Seconds                             |                               │
-  │  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+                               │
-  │  |                  Seconds Fraction (0-padded)                  | <-- 4294967296 = 1 second     │
-  │  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+                               │
-  └──────────────────────────────────────────────────────────────────────────────────────────────────┘*/
+#import <sys/time.h>
 
 #pragma -
 #pragma mark                        T i m e • C o n v e r t e r s
 
-#define JAN_1970    		0x83aa7e80                      // UNIX epoch in NTP's epoch:
-                                                            // 1970-1900 (2,208,988,800s)
-struct ntpTimestamp {
-    uint32_t      wholeSeconds;
-    uint32_t      fractSeconds;
-};
-
-static struct ntpTimestamp NTP_1970 = {JAN_1970, 0};        // network time for 1 January 1970, GMT
+static union ntpTime NTP_1970 = {0, JAN_1970};              // network time for 1 January 1970, GMT
 
 static double pollIntervals[18] = {
       2.0,   16.0,   16.0,   16.0,   16.0,    35.0,    72.0,  127.0,     258.0,
@@ -39,42 +20,38 @@ static double pollIntervals[18] = {
 };
 
 /*┌──────────────────────────────────────────────────────────────────────────────────────────────────┐
-  │ Convert from Unix time to NTP time                                                               │
-  └──────────────────────────────────────────────────────────────────────────────────────────────────┘*/
-void unix2ntp(const struct timeval * tv, struct ntpTimestamp * ntp) {
-    ntp->wholeSeconds = (uint32_t)(tv->tv_sec + JAN_1970);
-    ntp->fractSeconds = (uint32_t)(((double)tv->tv_usec + 0.5) * (double)(1LL<<32) * 1.0e-6);
-}
-
-/*┌──────────────────────────────────────────────────────────────────────────────────────────────────┐
-  │ Convert from NTP time to Unix time                                                               │
-  └──────────────────────────────────────────────────────────────────────────────────────────────────┘*/
-void ntp2unix(const struct ntpTimestamp * ntp, struct timeval * tv) {
-    tv->tv_sec  = ntp->wholeSeconds - JAN_1970;
-    tv->tv_usec = (uint32_t)((double)ntp->fractSeconds / (1LL<<32) * 1.0e6);
-}
-
-/*┌──────────────────────────────────────────────────────────────────────────────────────────────────┐
   │ get current time in NTP format                                                                   │
   └──────────────────────────────────────────────────────────────────────────────────────────────────┘*/
-void ntp_time_now(struct ntpTimestamp * ntp) {
-    struct timeval          now;
+union ntpTime ntp_time_now() {
+    struct timeval      now;
     gettimeofday(&now, (struct timezone *)NULL);
-    unix2ntp(&now, ntp);
+    return unix2ntp(&now);
+}
+
+/*┌──────────────────────────────────────────────────────────────────────────────────────────────────┐
+  │ Convert from Unix time to NTP time                                                               │
+  │     (on MacOSX clock resolution is 1μS, so ntp's ~12 low bits are meaningless)                   │
+  └──────────────────────────────────────────────────────────────────────────────────────────────────┘*/
+union ntpTime unix2ntp(const struct timeval * tv) {
+    union ntpTime   ntp1;
+
+    ntp1.partials.wholeSeconds = (uint32_t)(tv->tv_sec + JAN_1970);
+    ntp1.partials.fractSeconds = (uint32_t)((double)tv->tv_usec * (1LL<<32) * 1.0e-6);
+    return ntp1;
 }
 
 /*┌──────────────────────────────────────────────────────────────────────────────────────────────────┐
   │ get (ntpTime2 - ntpTime1) in (double) seconds                                                    │
   └──────────────────────────────────────────────────────────────────────────────────────────────────┘*/
-double ntpDiffSeconds(struct ntpTimestamp * start, struct ntpTimestamp * stop) {
+double ntpDiffSeconds(union ntpTime * start, union ntpTime * stop) {
     int32_t         a;
     uint32_t        b;
-    a = stop->wholeSeconds - start->wholeSeconds;
-    if (stop->fractSeconds >= start->fractSeconds) {
-        b = stop->fractSeconds - start->fractSeconds;
+    a = stop->partials.wholeSeconds - start->partials.wholeSeconds;
+    if (stop->partials.fractSeconds >= start->partials.fractSeconds) {
+        b = stop->partials.fractSeconds - start->partials.fractSeconds;
     }
     else {
-        b = start->fractSeconds - stop->fractSeconds;
+        b = start->partials.fractSeconds - stop->partials.fractSeconds;
         b = ~b;
         a -= 1;
     }
@@ -82,6 +59,9 @@ double ntpDiffSeconds(struct ntpTimestamp * start, struct ntpTimestamp * stop) {
     return a + b / 4294967296.0;
 }
 
+/*┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+  ┃ NetAssociation: Private Variables                                                                ┃
+  ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛*/
 @interface NetAssociation () {
 
     GCDAsyncUdpSocket *     socket;                         // NetAssociation UDP Socket
@@ -89,7 +69,7 @@ double ntpDiffSeconds(struct ntpTimestamp * start, struct ntpTimestamp * stop) {
     NSTimer *               repeatingTimer;                 // fires off an ntp request ...
     int                     pollingIntervalIndex;           // index into polling interval table
 
-    struct ntpTimestamp     ntpClientSendTime,
+    union ntpTime           ntpClientSendTime,
                             ntpServerRecvTime,
                             ntpServerSendTime,
                             ntpClientRecvTime,
@@ -139,6 +119,8 @@ double ntpDiffSeconds(struct ntpTimestamp * start, struct ntpTimestamp * stop) {
                                                delegateQueue:dispatch_queue_create(
                    [serverName cStringUsingEncoding:NSUTF8StringEncoding], DISPATCH_QUEUE_SERIAL)];
 
+//        [socket setReceiveFilter:filter withQueue:dispatch_get_main_queue()];
+
 		[self registerObservations];
     }
 //  NSLog(@"Assoc•Init: [%@]", serverName);
@@ -178,7 +160,7 @@ double ntpDiffSeconds(struct ntpTimestamp * start, struct ntpTimestamp * stop) {
   └──────────────────────────────────────────────────────────────────────────────────────────────────┘*/
     timerWobbleFactor = ((float)rand()/(float)RAND_MAX / 2.0) + 0.75;       // 0.75 .. 1.25
     NSTimeInterval  interval = pollIntervals[pollingIntervalIndex] * timerWobbleFactor;
-    [repeatingTimer setFireDate:[NSDate dateWithTimeIntervalSinceNow:interval]];
+    repeatingTimer.fireDate = [NSDate dateWithTimeIntervalSinceNow:interval];
 
     pollingIntervalIndex = 4;                           // subsequent timers fire at default intervals
 }
@@ -194,7 +176,7 @@ double ntpDiffSeconds(struct ntpTimestamp * start, struct ntpTimestamp * stop) {
   └──────────────────────────────────────────────────────────────────────────────────────────────────┘*/
     timerWobbleFactor = ((float)rand()/(float)RAND_MAX / 2.0) + 0.75;       // 0.75 .. 1.25
     NSTimeInterval  interval = pollIntervals[pollingIntervalIndex] * timerWobbleFactor;
-    [repeatingTimer setFireDate:[NSDate dateWithTimeIntervalSinceNow:interval]];
+    repeatingTimer.fireDate = [NSDate dateWithTimeIntervalSinceNow:interval];
 }
 
 /*┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
@@ -215,10 +197,11 @@ double ntpDiffSeconds(struct ntpTimestamp * start, struct ntpTimestamp * stop) {
   ┃ This stops the timer firing (sets the fire time to the infinite future) ...                      ┃
   ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛*/
 - (void) finish {
-    [repeatingTimer setFireDate:[NSDate distantFuture]];
 
     for (short i = 0; i < 8; i++) fifoQueue[i] = NAN;      // set fifo to all empty
     fifoIndex = 0;
+
+    [repeatingTimer invalidate];
 
     _active = FALSE;
 }
@@ -271,10 +254,10 @@ double ntpDiffSeconds(struct ntpTimestamp * start, struct ntpTimestamp * stop) {
 	wireData[1] = htonl(1<<16);
 	wireData[2] = htonl(1<<16);
 
-    ntp_time_now(&ntpClientSendTime);
+    ntpClientSendTime = ntp_time_now();
 
-    wireData[10] = htonl(ntpClientSendTime.wholeSeconds);                   // Transmit Timestamp
-	wireData[11] = htonl(ntpClientSendTime.fractSeconds);
+    wireData[10] = htonl(ntpClientSendTime.partials.wholeSeconds);                   // Transmit Timestamp
+	wireData[11] = htonl(ntpClientSendTime.partials.fractSeconds);
 
     return [NSData dataWithBytes:wireData length:48];
 }
@@ -283,7 +266,7 @@ double ntpDiffSeconds(struct ntpTimestamp * start, struct ntpTimestamp * stop) {
 /*┌──────────────────────────────────────────────────────────────────────────────────────────────────┐
   │  grab the packet arrival time as fast as possible, before computations below ...                 │
   └──────────────────────────────────────────────────────────────────────────────────────────────────┘*/
-    ntp_time_now(&ntpClientRecvTime);
+    ntpClientRecvTime = ntp_time_now();
 
     uint32_t        wireData[12];
     [data getBytes:wireData length:48];
@@ -309,19 +292,19 @@ double ntpDiffSeconds(struct ntpTimestamp * start, struct ntpTimestamp * stop) {
 
     refid   = ntohl(wireData[3]);
 
-    ntpServerBaseTime.wholeSeconds = ntohl(wireData[4]);                // when server clock was wound
-    ntpServerBaseTime.fractSeconds = ntohl(wireData[5]);
+    ntpServerBaseTime.partials.wholeSeconds = ntohl(wireData[4]);                // when server clock was wound
+    ntpServerBaseTime.partials.fractSeconds = ntohl(wireData[5]);
 
 /*┌──────────────────────────────────────────────────────────────────────────────────────────────────┐
   │  if the send time in the packet isn't the same as the remembered send time, ditch it ...         │
   └──────────────────────────────────────────────────────────────────────────────────────────────────┘*/
-    if (ntpClientSendTime.wholeSeconds != ntohl(wireData[6]) ||
-        ntpClientSendTime.fractSeconds != ntohl(wireData[7])) return;   //  NO;
+    if (ntpClientSendTime.partials.wholeSeconds != ntohl(wireData[6]) ||
+        ntpClientSendTime.partials.fractSeconds != ntohl(wireData[7])) return;   //  NO;
 
-    ntpServerRecvTime.wholeSeconds = ntohl(wireData[8]);
-    ntpServerRecvTime.fractSeconds = ntohl(wireData[9]);
-    ntpServerSendTime.wholeSeconds = ntohl(wireData[10]);
-    ntpServerSendTime.fractSeconds = ntohl(wireData[11]);
+    ntpServerRecvTime.partials.wholeSeconds = ntohl(wireData[8]);
+    ntpServerRecvTime.partials.fractSeconds = ntohl(wireData[9]);
+    ntpServerSendTime.partials.wholeSeconds = ntohl(wireData[10]);
+    ntpServerSendTime.partials.fractSeconds = ntohl(wireData[11]);
 
 //  NTP_Logging(@"%@", [self prettyPrintPacket]);
 
@@ -353,7 +336,7 @@ double ntpDiffSeconds(struct ntpTimestamp * start, struct ntpTimestamp * stop) {
 //      NTP_Logging(@"%@", [self prettyPrintTimers]);
     }
 
-    [_delegate reportFromDelegate];                                 // tell delegate we're done
+    dispatch_async(dispatch_get_main_queue(), ^{ [_delegate reportFromDelegate]; });// tell delegate we're done
 }
 
 - (void) reportFromDelegate {
@@ -408,8 +391,8 @@ double ntpDiffSeconds(struct ntpTimestamp * start, struct ntpTimestamp * stop) {
         }
         
         _trusty = (good+none > 4) &&                                // four or more 'fails'
-                  (fabs(_offset) > stdDev*3.0);                     // s.d. < offset
-        
+                  (fabs(_offset) > 3.0 * stdDev);                   // s.d. < offset * 2
+
         NTP_Logging(@"  [%@] {%3.1f,%3.1f,%3.1f,%3.1f,%3.1f,%3.1f,%3.1f,%3.1f} ↑=%i, ↓=%i, %3.1f(%3.1f) %@", _server,
                     fifoQueue[0]*1000.0, fifoQueue[1]*1000.0, fifoQueue[2]*1000.0, fifoQueue[3]*1000.0,
                     fifoQueue[4]*1000.0, fifoQueue[5]*1000.0, fifoQueue[6]*1000.0, fifoQueue[7]*1000.0,
@@ -429,39 +412,85 @@ double ntpDiffSeconds(struct ntpTimestamp * start, struct ntpTimestamp * stop) {
     }
 }
 
+#pragma mark                        I n b o u n d • D a t a   F i l t e r
+
+GCDAsyncUdpSocketReceiveFilterBlock filter = ^BOOL (NSData *data, NSData *address, id *context) {
+
+    return TRUE;
+
+};
+
 #pragma mark                        N e t w o r k • C a l l b a c k s
 
-- (void)udpSocket:(GCDAsyncUdpSocket *)sock didConnectToAddress:(NSData *)address {
-    NTP_Logging(@"didConnectToAddress");
+- (void) udpSocket:(GCDAsyncUdpSocket *)sock didSendDataWithTag:(long)tag {
 }
 
-- (void)udpSocket:(GCDAsyncUdpSocket *)sock didNotConnect:(NSError *)error {
-    NTP_Logging(@"didNotConnect - %@", error.description);
-}
-
-- (void)udpSocket:(GCDAsyncUdpSocket *)sock didSendDataWithTag:(long)tag {
-}
-
-- (void)udpSocket:(GCDAsyncUdpSocket *)sock didNotSendDataWithTag:(long)tag dueToError:(NSError *)error {
+- (void) udpSocket:(GCDAsyncUdpSocket *)sock didNotSendDataWithTag:(long)tag dueToError:(NSError *)error {
     NTP_Logging(@"didNotSendDataWithTag - %@", error.description);
 }
 
-- (void)udpSocket:(GCDAsyncUdpSocket *)sock didReceiveData:(NSData *)data
-      fromAddress:(NSData *)address withFilterContext:(id)filterContext {
-//  NTP_Logging(@"didReceiveData - [%@]", [GCDAsyncUdpSocket hostFromAddress:address]);
+- (void) udpSocket:(GCDAsyncUdpSocket *)sock
+    didReceiveData:(NSData *)data
+       fromAddress:(NSData *)address
+ withFilterContext:(id)filterContext {
+
+    if (![_server isEqualToString:[GCDAsyncUdpSocket hostFromAddress:address]]) {
+        NTP_Logging(@"### didReceiveData - addr: %@ + %@", [GCDAsyncUdpSocket hostFromAddress:address], _server);
+    }
 
     [self decodePacket:data];
+
 }
 
-- (void)udpSocketDidClose:(GCDAsyncUdpSocket *)sock withError:(NSError *)error {
+- (void) udpSocketDidClose:(GCDAsyncUdpSocket *)sock
+                 withError:(NSError *)error {
     NTP_Logging(@"Socket closed : [%@]", _server);
 }
 
 /*┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
   ┃ Make an NSDate from ntpTimestamp ... (via seconds from JAN_1970) ...                             ┃
   ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛*/
-- (NSDate *) dateFromNetworkTime:(struct ntpTimestamp *) networkTime {
+- (NSDate *) dateFromNetworkTime:(union ntpTime *) networkTime {
     return [NSDate dateWithTimeIntervalSince1970:ntpDiffSeconds(&NTP_1970, networkTime)];
+}
+
++ (NSString *) ipAddrFromName: (NSString *) domainName {
+/*┌──────────────────────────────────────────────────────────────────────────────────────────────────┐
+  │  ... resolve the IP address of the named host : "0.pool.ntp.org" --> [123.45.67.89], ...         │
+  └──────────────────────────────────────────────────────────────────────────────────────────────────┘*/
+    CFHostRef ntpHostName = CFHostCreateWithName (nil, (__bridge CFStringRef)domainName);
+    if (nil == ntpHostName) {
+        NTP_Logging(@"CFHostCreateWithName <nil> for %@", domainName);
+        return NULL;                                         // couldn't create 'host object' ...
+    }
+
+    CFStreamError   nameError;
+    if (!CFHostStartInfoResolution (ntpHostName, kCFHostAddresses, &nameError)) {
+        NTP_Logging(@"CFHostStartInfoResolution error %i for %@", (int)nameError.error, domainName);
+        CFRelease(ntpHostName);
+        return NULL;                                        // couldn't start resolution ...
+    }
+
+    Boolean         nameFound;
+    NSArray *       ntpHostAddrs = (__bridge NSArray *)(CFHostGetAddressing (ntpHostName, &nameFound));
+
+    if (!nameFound) {
+        NTP_Logging(@"CFHostGetAddressing: %@ NOT resolved", ntpHostName);
+        CFRelease(ntpHostName);
+        return NULL;                                        // resolution failed ...
+    }
+
+    if (ntpHostAddrs == nil || ntpHostAddrs.count == 0) {
+        NTP_Logging(@"CFHostGetAddressing: no addresses resolved for %@", ntpHostName);
+        CFRelease(ntpHostName);
+        return NULL;                                        // NO addresses were resolved ...
+    }
+    CFRelease(ntpHostName);
+/*┌──────────────────────────────────────────────────────────────────────────────────────────────────┐
+  │  for each (sockaddr structure wrapped by a CFDataRef/NSData *) associated with the hostname,     │
+  │  drop the IP address string into a Set to remove duplicates.                                     │
+  └──────────────────────────────────────────────────────────────────────────────────────────────────┘*/
+    return [GCDAsyncUdpSocket hostFromAddress:ntpHostAddrs[0]];
 }
 
 #pragma mark                        P r e t t y P r i n t e r s
@@ -477,38 +506,30 @@ double ntpDiffSeconds(struct ntpTimestamp * start, struct ntpTimestamp * stop) {
     [prettyString appendFormat:@"      root delay: %7.3f (mS)\n"
                                 "      dispersion: %7.3f (mS)\n\n", _root_delay, _dispersion];
 
-    struct timeval      tempTime;
-
-    ntp2unix(&ntpClientSendTime, &tempTime);
     [prettyString appendFormat:@"client send time: %010u.%06d (%@)\n",
-                        ntpClientSendTime.wholeSeconds,
-                        tempTime.tv_usec,
+                        ntpClientSendTime.partials.wholeSeconds,
+                        (uint32_t)((double)ntpClientSendTime.partials.fractSeconds / (1LL<<32) * 1.0e6),
                         [self dateFromNetworkTime:&ntpClientSendTime]];
 
-    ntp2unix(&ntpServerRecvTime, &tempTime);
     [prettyString appendFormat:@"server recv time: %010u.%06d (%@)\n",
-                        ntpServerRecvTime.wholeSeconds,
-                        tempTime.tv_usec,
+                        ntpServerRecvTime.partials.wholeSeconds,
+                        (uint32_t)((double)ntpServerRecvTime.partials.fractSeconds / (1LL<<32) * 1.0e6),
                         [self dateFromNetworkTime:&ntpServerRecvTime]];
 
-    ntp2unix(&ntpServerSendTime, &tempTime);
     [prettyString appendFormat:@"server send time: %010u.%06d (%@)\n",
-                        ntpServerSendTime.wholeSeconds,
-                        tempTime.tv_usec,
+                        ntpServerSendTime.partials.wholeSeconds,
+                        (uint32_t)((double)ntpServerSendTime.partials.fractSeconds / (1LL<<32) * 1.0e6),
                         [self dateFromNetworkTime:&ntpServerSendTime]];
 
-    ntp2unix(&ntpClientRecvTime, &tempTime);
     [prettyString appendFormat:@"client recv time: %010u.%06d (%@)\n\n",
-                        ntpClientRecvTime.wholeSeconds,
-                        tempTime.tv_usec,
+                        ntpClientRecvTime.partials.wholeSeconds,
+                        (uint32_t)((double)ntpClientRecvTime.partials.fractSeconds / (1LL<<32) * 1.0e6),
                         [self dateFromNetworkTime:&ntpClientRecvTime]];
 
-    ntp2unix(&ntpServerBaseTime, &tempTime);
     [prettyString appendFormat:@"server clock set: %010u.%06d (%@)\n\n",
-                        ntpServerBaseTime.wholeSeconds,
-                        tempTime.tv_usec,
+                        ntpServerBaseTime.partials.wholeSeconds,
+                        (uint32_t)((double)ntpServerBaseTime.partials.fractSeconds / (1LL<<32) * 1.0e6),
                         [self dateFromNetworkTime:&ntpServerBaseTime]];
-
 
     return prettyString;
 }
